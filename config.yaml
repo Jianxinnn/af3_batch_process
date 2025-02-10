@@ -1,0 +1,21 @@
+# Model paths and environment
+model:
+  weights_path: "/dataStor/share/weights/alphafold3"
+  database_path: "/dataStor/share/data/af3_deepmind_db"
+  env_name: "alphafold3_venv_a6000"
+
+# Directory settings
+paths:
+  input_dir: "/dataStor/home/jxtang/tmp/adar_search/input"
+  output_dir: "/dataStor/home/jxtang/tmp/adar_search/output"
+
+# Binary paths
+binaries:
+  jackhmmer: "/dataStor/home/jxtang/software/hmmer/bin/jackhmmer"
+  hmmbuild: "/dataStor/home/jxtang/software/hmmer/bin/hmmbuild"
+  hmmsearch: "/dataStor/home/jxtang/software/hmmer/bin/hmmsearch"
+  nhmmer: "/dataStor/home/jxtang/software/hmmer/bin/nhmmer"
+
+# AlphaFold3 execution
+execution:
+  base_dir: "/dataStor/home/jxtang/project/protein/structure/alphafold3"
