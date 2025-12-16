@@ -37,7 +37,7 @@ class AF3Adar(AlphaFoldModel):
         print(f'total: {analysis["total"]}, total_len: {analysis["total_len"]/analysis["total"]}, max_len: {max(analysis["total_len_list"])}, min_len: {min(analysis["total_len_list"])}')
         return sequences
     
-    def batch_run(self, gpu_ids="3,4,5,6"):
+    def batch_run(self, gpu_ids="2,3,4,5,6,7"):
         input_data = self.batch_prepare_sequences(self.sequences, "19989898")
         num_gpus = len(gpu_ids.split(","))
         input_data = self.prepare_input(input_data, batch_mode=True, num_gpus=num_gpus, name_prefix="ADAR_res_700")

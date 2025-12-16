@@ -1,0 +1,142 @@
+# AlphaFold3 本地批量预测
+## 你要做的事（3 步）
+
+1) 准备初始输入（FASTA 或 JSON）  
+2) 生成/准备 AF3 输入 JSON（raw → prepared）  
+3) 按 GPU 切分并运行，产出结果目录
+
+---
+
+## 一次跑通：推荐入口（统一脚本）
+
+用 `af3_run_from_json.py` 一条命令跑完整流程（自动识别输入类型）：
+
+```bash
+python af3_run_from_json.py <input.json> --device cuda:<id[,id...]> [--output-dir <dir>] \
+  [--model-seeds <seed[,seed...]>] [--dialect alphafoldserver|alphafold3] [--version <N>] [--name-prefix <prefix>] [--single]
+```
+
+它支持两种输入：
+- raw cases（不含 `sequences`）：先 prepare，再预测
+- prepared jobs（已含 `sequences`）：直接预测
+
+---
+
+## 初始输入是什么（选一种起点）
+
+### 起点 A：只有蛋白 FASTA
+
+1) FASTA → raw cases JSON：
+
+```bash
+python fasta_to_af3json.py <proteins.fasta> -o <cases.raw.json> \
+  [--name-prefix <prefix>] [--ligand/--rna/--dna/--ccd ...] [--ligand-file/--rna-file/--dna-file/--ccd-file ...]
+```
+
+FASTA 长这样（每条记录一条蛋白）：
+
+```fasta
+>job1
+MKT...
+>job2
+GAA...
+```
+
+2) raw cases → 预测：
+
+```bash
+python af3_run_from_json.py <cases.raw.json> --device cuda:<id[,id...]>
+```
+
+### 起点 B：你已经有 raw cases JSON
+
+raw cases 形如 `List[Dict]`：每条至少包含 `name`、`protein`（可加 `rna/dna/ligand/ccd` 等）。  
+直接跑：
+
+```bash
+python af3_run_from_json.py <cases.raw.json> --device cuda:<id[,id...]>
+```
+
+raw cases JSON 长这样（数组里每个元素是一个 job）：
+
+```json
+[
+  {
+    "name": "job1",
+    "protein": "MKT..."
+  },
+  {
+    "name": "job2",
+    "protein": "GAA...",
+    "ligand": "CC(=O)N...",
+    "ccd": "ATP,MG",
+    "rna": "GCAG...",
+    "dna": "GCTC..."
+  }
+]
+```
+
+### 起点 C：你已经有 prepared jobs JSON
+
+prepared jobs 形如 `List[Dict]`：每条包含 `name/modelSeeds/sequences/dialect/version`。  
+直接跑：
+
+```bash
+python af3_run_from_json.py <jobs.prepared.json> --device cuda:<id[,id...]>
+```
+
+prepared jobs JSON 长这样（已包含 `sequences`，可直接喂给入口脚本）：
+
+```json
+[
+  {
+    "name": "job1",
+    "modelSeeds": [234321],
+    "dialect": "alphafoldserver",
+    "version": 1,
+    "sequences": [
+      {"proteinChain": {"sequence": "MKT...", "useStructureTemplate": true, "count": 1}},
+      {"ligand": {"smiles": "CC(=O)N..."}}
+    ]
+  }
+]
+```
+
+---
+
+## 批量怎么扩（从单 GPU 到多 GPU）
+
+- 单 GPU：`--device cuda:0`
+- 多 GPU：`--device cuda:0,1,2,...`（脚本会按 GPU 数把 jobs 切分为多份输入文件，并并行启动多个 `run_alphafold.py`）
+- 增量追加：往 JSON 里追加新 job 后重复运行；已完成 job 会被自动跳过（检查输出三件套是否存在且非空）
+
+---
+
+## 需要配置什么（`config.yaml`）
+
+`alphafold3_localbase.py` 会读取同目录 `config.yaml`，关键字段：
+- `model.weights_path`、`model.database_path`、`model.env_name`
+- `paths.input_dir`、`paths.output_dir`
+- `binaries.jackhmmer/hmmbuild/hmmsearch/nhmmer`
+- `execution.base_dir`（包含 `run_alphafold.py` 的目录）
+
+---
+
+## 输出在哪里（结果样式）
+
+输出根目录：`config.yaml: paths.output_dir`（或 `af3_run_from_json.py --output-dir`）。  
+每个 job 一个子目录：`<output_dir>/<name.lower()>/`，包含：
+- `<name.lower()>_model.cif`
+- `<name.lower()>_confidences.json`
+- `<name.lower()>_summary_confidences.json`
+
+---
+
+## 建议
+
+> 如果是“一个 FASTA 里很多蛋白 + 全部用同一个 ligand/rna/dna（广播到所有蛋白）”，推荐走起点 A：`fasta_to_af3json.py` 用 `--ligand/--rna/--dna`（单值广播）生成 `<cases.raw.json>`，再用 `af3_run_from_json.py` 批量跑；最省事、最不容易行数对不齐。
+
+> 如果是“不同蛋白对应不同 ligand/rna/dna/ccd（逐条不一样）”，推荐还是起点 A，但用 `fasta_to_af3json.py` 的 `--ligand-file/--rna-file/--dna-file/--ccd-file` 做成“逐条映射文件”（有效行数必须和 FASTA 条目数一致），生成 `<cases.raw.json>` 后再用 `af3_run_from_json.py` 批量跑。
+
+> 如果你的“不同蛋白 + 不同配体/核酸”来源是表格/数据库（比如 CSV 里已经有每行一条记录），推荐直接构造起点 B 的 raw cases JSON（每条一个 dict），跳过 FASTA 映射文件这一步，直接 `af3_run_from_json.py <cases.raw.json>`。
+

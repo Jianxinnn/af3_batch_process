@@ -1,17 +1,23 @@
-from typing import Dict, List
+from typing import Dict, List, Optional
 from pathlib import Path
 import json
 import os
 import yaml
-
+import sys
+import re
+import shutil
+sys.path.append(os.path.dirname(__file__))
 from execution import run_alphafold
+
+# Default modelSeeds if none provided in input
+DEFAULT_MODEL_SEEDS = [234321]
 
 
 class AlphaFoldModel:
-    def __init__(self):
+    def __init__(self, input_dir: str = None, output_dir: str = None):
         self.config = self._load_config()
-        self.INPUT_DIR = self.config["paths"]["input_dir"]
-        self.OUTPUT_DIR = self.config["paths"]["output_dir"]
+        self.INPUT_DIR = self.config["paths"]["input_dir"] if input_dir is None else input_dir
+        self.OUTPUT_DIR = self.config["paths"]["output_dir"] if output_dir is None else output_dir
         
     def _load_config(self) -> Dict:
         """Load configuration from config.yaml"""
@@ -51,123 +57,161 @@ class AlphaFoldModel:
     def output_summary_pattern(self) -> str:
         return "{}_summary_confidences.json"   
     
-    def input_template(self, job_name, model_seeds, sequences, dialect="alphafoldserver") -> Dict:
-        return {
+    def input_template(self, job_name, model_seeds, sequences, dialect: str = "alphafoldserver", version: Optional[int] = None, extras: Optional[Dict] = None) -> Dict:
+        """Construct top-level input JSON for AF3.
+
+        dialect: 'alphafoldserver' (default) or 'alphafold3'
+        version: if None → 1 for 'alphafoldserver', 4 for 'alphafold3'
+        extras: optional dict with keys among {'bondedAtomPairs','userCCD','userCCDPath'}
+        """
+        if version is None:
+            version = 4 if dialect == "alphafold3" else 1
+        tpl = {
             "name": job_name,
             "modelSeeds": model_seeds,
             "sequences": sequences,
             "dialect": dialect,
-            "version": 1
+            "version": version,
         }
+        if extras:
+            for k in ("bondedAtomPairs", "userCCD", "userCCDPath"):
+                if k in extras and extras[k] is not None:
+                    tpl[k] = extras[k]
+        return tpl
     
-    def single_prepare_sequences(self, sequences: List[Dict], model_seeds) -> List[List[Dict]]:
-        """
-        Convert input sequences to AlphaFold3 format.
-        Input format: [{'protein':'XX', 'rna':'XX'}, {'protein':'XX', 'dna':'XX', 'rna':'XX'}, ...]
-        Output format: [[{"protein": {"sequence": "XX", "id": "A"}}, {"rna": {"sequence": "XX", "id": "B"}}], ...]
-        """
-        prepared_sequences = []
-        model_seeds = [int(seed.strip()) for seed in model_seeds.split(",") if seed.strip().isdigit()]
-        dialect = "alphafold3"
-        for case in sequences:
-            prepared_case = []
-            
-            for i, (seq_type, seq) in enumerate(case.items()):
-                if seq_type == 'name':
-                    job_name = seq
-                    continue
-                # Clean and format sequence
-                cleaned_seq = seq.upper().replace(' ', '').replace('\n', '')
-                
-                # Create entity with ID (A, B, C, etc.)
-                if seq_type == "ligand":
-                    entity = {
-                        "ligand": {
-                            "smiles": cleaned_seq,
-                            "id": chr(65 + i)  # 65 is ASCII for 'A'
-                        }
-                    }
-                elif seq_type == "ccd":
-                    entity = {
-                        "ligand": {
-                            "ccdCodes": cleaned_seq,
-                            "id": chr(65 + i)  # 65 is ASCII for 'A'
-                        }
-                    }
-                else:
-                    entity = {
-                        seq_type: {
-                            "sequence": cleaned_seq,
-                            "id": chr(65 + i)  # 65 is ASCII for 'A'
-                        }
-                    }
-                prepared_case.append(entity)
+    def single_prepare_sequences(self, sequences: List[Dict], model_seeds, dialect: str = "alphafold3", version: Optional[int] = None) -> List[Dict]:
+        """Prepare a list of jobs from raw cases for a single-GPU style run.
 
-            case_template = self.input_template(job_name, model_seeds, prepared_case, dialect)
-            prepared_sequences.append(case_template)
-        return prepared_sequences
-    
-    def batch_prepare_sequences(self, sequences: List[Dict], model_seeds) -> List[List[Dict]]:
+        Raw case: {'protein': '...', ['rna'|'dna'|'ligand'|'ccd']: '...', 'name': '...'}
+        - dialect 'alphafold3': entities include 'id' letters and use keys 'protein'/'rna'/'dna'/'ligand'.
+        - dialect 'alphafoldserver': entities use 'proteinChain'/'rnaSequence'/'dnaSequence'/'ligand'/'ccdCode'.
         """
-        Convert input sequences to AlphaFold3 format.
-        Input format: [{'protein':'XX', 'rna':'XX'}, {'protein':'XX', 'dna':'XX', 'rna':'XX'}, ...]
-        Output format: [[{"proteinChain": {"sequence": "XX", "id": "A"}}, {"rnaSequence": {"sequence": "XX", "id": "B"}}], ...]
-        """
-        prepared_sequences = []
-        model_seeds = [int(seed.strip()) for seed in model_seeds.split(",") if seed.strip().isdigit()]
+        prepared = []
+        model_seeds = [int(seed.strip()) for seed in str(model_seeds).split(",") if seed.strip().isdigit()]
 
         for case in sequences:
+            job_name = case.get('name', 'job')
             prepared_case = []
-            for i, (seq_type, seq) in enumerate(case.items()):
-                if seq_type == 'name':
-                    job_name = seq
-                    continue
+            extras = {
+                'bondedAtomPairs': case.get('bondedAtomPairs'),
+                'userCCD': case.get('userCCD'),
+                'userCCDPath': case.get('userCCDPath'),
+            }
 
-                # Clean and format sequence
-                cleaned_seq = seq.upper().replace(' ', '').replace('\n', '')
-                
-                # Create entity with ID (A, B, C, etc.)
-                if seq_type == "protein":
-                    entity = {
-                        "proteinChain": {
-                            "sequence": cleaned_seq,
-                            "useStructureTemplate": True,
-                            "count": 1
-                        }
-                    }
-                elif seq_type == "rna":
-                    entity = {
-                        "rnaSequence": {
-                            "sequence": cleaned_seq,
-                            "count": 1
-                        }
-                    }   
-                elif seq_type == "dna":
-                    entity = {
-                        "dnaSequence": {
-                            "sequence": cleaned_seq,
-                            "count": 1
-                        }
-                    }
-                elif seq_type == "ligand":
-                    entity = {
-                        "ligand": {
-                            "smiles": cleaned_seq
-                        }
-                    }
-                elif seq_type == "ccd":
-                    entity = {
-                        "ccdCode": {
-                            "ccdCodes": cleaned_seq
-                        }
-                    }
+            chain_idx = 0
+            for key, seq in case.items():
+                if key in ('name', 'bondedAtomPairs', 'userCCD', 'userCCDPath'):
+                    continue
+                if seq is None:
+                    continue
+                cleaned = seq.upper().replace(' ', '').replace('\n', '') if key in ("protein", "rna", "dna", "ccd") else seq
+
+                if dialect == 'alphafold3':
+                    chain_id = chr(65 + chain_idx)
+                    if key == 'ligand':
+                        entity = {"ligand": {"id": chain_id, "smiles": seq}}
+                    elif key == 'ccd':
+                        entity = {"ligand": {"id": chain_id, "ccdCodes": list(self.re_split_codes(cleaned))}}
+                    elif key == 'rna':
+                        entity = {"rna": {"id": chain_id, "sequence": cleaned}}
+                    elif key == 'dna':
+                        entity = {"dna": {"id": chain_id, "sequence": cleaned}}
+                    else:
+                        entity = {"protein": {"id": chain_id, "sequence": cleaned}}
                 else:
-                    raise ValueError(f"Unsupported sequence type: {seq_type}")
+                    if key == 'ligand':
+                        entity = {"ligand": {"smiles": seq}}
+                    elif key == 'ccd':
+                        entity = {"ccdCode": {"ccdCodes": cleaned}}
+                    elif key == 'rna':
+                        entity = {"rnaSequence": {"sequence": cleaned, "count": 1}}
+                    elif key == 'dna':
+                        entity = {"dnaSequence": {"sequence": cleaned, "count": 1}}
+                    else:
+                        entity = {"proteinChain": {"sequence": cleaned, "useStructureTemplate": True, "count": 1}}
+
                 prepared_case.append(entity)
-            
-            case_template = self.input_template(job_name, model_seeds, prepared_case)
-            prepared_sequences.append(case_template)
-        return prepared_sequences
+                chain_idx += 1
+
+            job = self.input_template(job_name, model_seeds, prepared_case, dialect, version, extras)
+            prepared.append(job)
+        return prepared
+    
+    def batch_prepare_sequences(self, sequences: List[Dict], model_seeds, dialect: str = "alphafoldserver", version: Optional[int] = None) -> List[Dict]:
+        """Prepare a list of jobs from raw cases for batch mode with selectable dialect."""
+        prepared = []
+        model_seeds = [int(seed.strip()) for seed in str(model_seeds).split(",") if seed.strip().isdigit()]
+
+        for case in sequences:
+            job_name = case.get('name', 'job')
+            prepared_case = []
+            extras = {
+                'bondedAtomPairs': case.get('bondedAtomPairs'),
+                'userCCD': case.get('userCCD'),
+                'userCCDPath': case.get('userCCDPath'),
+            }
+
+            chain_idx = 0
+            for key, seq in case.items():
+                if key in ('name', 'bondedAtomPairs', 'userCCD', 'userCCDPath'):
+                    continue
+                if seq is None:
+                    continue
+                cleaned_seq = seq.upper().replace(' ', '').replace('\n', '') if key in ("protein", "rna", "dna", "ccd") else seq
+
+                if dialect == 'alphafold3':
+                    chain_id = chr(65 + chain_idx)
+                    if key == 'ligand':
+                        entity = {"ligand": {"id": chain_id, "smiles": seq}}
+                    elif key == 'ccd':
+                        entity = {"ligand": {"id": chain_id, "ccdCodes": list(self.re_split_codes(cleaned_seq))}}
+                    elif key == 'rna':
+                        entity = {"rna": {"id": chain_id, "sequence": cleaned_seq}}
+                    elif key == 'dna':
+                        entity = {"dna": {"id": chain_id, "sequence": cleaned_seq}}
+                    else:
+                        entity = {"protein": {"id": chain_id, "sequence": cleaned_seq}}
+                else:
+                    if key == 'ligand':
+                        entity = {"ligand": {"smiles": seq}}
+                    elif key == 'ccd':
+                        entity = {"ccdCode": {"ccdCodes": cleaned_seq}}
+                    elif key == 'rna':
+                        entity = {"rnaSequence": {"sequence": cleaned_seq, "count": 1}}
+                    elif key == 'dna':
+                        entity = {"dnaSequence": {"sequence": cleaned_seq, "count": 1}}
+                    else:
+                        entity = {"proteinChain": {"sequence": cleaned_seq, "useStructureTemplate": True, "count": 1}}
+
+                prepared_case.append(entity)
+                chain_idx += 1
+
+            case_template = self.input_template(job_name, model_seeds, prepared_case, dialect, version, extras)
+            prepared.append(case_template)
+        return prepared
+
+    # End of class
+
+    # Helpers
+    @staticmethod
+    def re_split_codes(text: str):
+        """Split CCD codes string into list of uppercase tokens.
+
+        Accept separators: comma, whitespace, semicolon. E.g. "ATP,MG" → ["ATP","MG"]
+        """
+        tokens = re.split(r"[\s,;]+", text.strip()) if text else []
+        return [t.upper() for t in tokens if t]
+
+    @staticmethod
+    def _ensure_model_seeds(job: Dict) -> Dict:
+        """Ensure 'modelSeeds' exists and is non-empty for a job dict.
+
+        Mutates and returns the job dict. Uses DEFAULT_MODEL_SEEDS when absent/empty.
+        """
+        seeds = job.get("modelSeeds")
+        if not seeds:
+            job["modelSeeds"] = list(DEFAULT_MODEL_SEEDS)
+        return job
 
     def prepare_input(self, alphafold_input, batch_mode=False, num_gpus=1, name_prefix="test123") -> Dict:
         # Save input JSON
@@ -233,6 +277,25 @@ class AlphaFoldModel:
     def run_prediction(self, input_data: Dict, placeholder=None, device="cuda:0") -> str:
         import json
 
+        def _build_command(json_path: str, gpu_id: str) -> str:
+            return (
+                f"cd {self.config['execution']['base_dir']} && "
+                f"CUDA_VISIBLE_DEVICES={gpu_id} conda run -n {self.required_env} "
+                f"python run_alphafold.py "
+                f"--json_path={json_path} "
+                f"--model_dir={self.model_weights_path} "
+                f"--output_dir={self.OUTPUT_DIR} "
+                f"--db_dir={self.database_path} "
+                f"--jackhmmer_binary_path={self.config['binaries']['jackhmmer']} "
+                f"--hmmbuild_binary_path={self.config['binaries']['hmmbuild']} "
+                f"--hmmsearch_binary_path={self.config['binaries']['hmmsearch']} "
+                f"--nhmmer_binary_path={self.config['binaries']['nhmmer']} "
+            )
+
+        # Unified stash for per-job AF3 input JSONs
+        af3_stash_dir = os.path.join(self.INPUT_DIR, "af3_input_jsons")
+        os.makedirs(af3_stash_dir, exist_ok=True)
+
         if input_data.get("batch_mode", False) and ":" in device:
             gpu_ids = device.split(":")[1].split(",")
             num_gpus = len(gpu_ids)
@@ -247,35 +310,66 @@ class AlphaFoldModel:
                     # Read jobs info to check if predictions exist
                     with open(input_path) as f:
                         jobs_data = json.load(f)
-                    
-                    # Create a new list for jobs that need processing
-                    jobs_to_process = []
-                    for job in jobs_data:
-                        if not self.check_prediction_exists(job["name"]):
-                            jobs_to_process.append(job)
-                    
-                    if not jobs_to_process:
-                        print(f"All predictions in {input_path} already exist, skipping...")
-                        return
-                        
-                    # Write filtered jobs back to file
-                    with open(input_path, 'w') as f:
-                        json.dump(jobs_to_process, f, indent=2)
-                    
-                    command = (
-                        f"cd {self.config['execution']['base_dir']} && "
-                        f"CUDA_VISIBLE_DEVICES={gpu_id} conda run -n {self.required_env} "
-                        f"python run_alphafold.py "
-                        f"--json_path={input_path} "
-                        f"--model_dir={self.model_weights_path} "
-                        f"--output_dir={self.OUTPUT_DIR} "
-                        f"--db_dir={self.database_path} "
-                        f"--jackhmmer_binary_path={self.config['binaries']['jackhmmer']} "
-                        f"--hmmbuild_binary_path={self.config['binaries']['hmmbuild']} "
-                        f"--hmmsearch_binary_path={self.config['binaries']['hmmsearch']} "
-                        f"--nhmmer_binary_path={self.config['binaries']['nhmmer']} "
-                    )
-                    return run_alphafold(command, placeholder)
+                    # Normalize to list
+                    if not isinstance(jobs_data, list):
+                        jobs = [jobs_data]
+                    else:
+                        jobs = jobs_data
+
+                    # Partition jobs: AF3 vs others
+                    af3_jobs = []
+                    other_jobs = []
+                    for job in jobs:
+                        if job.get("dialect") == "alphafold3":
+                            af3_jobs.append(job)
+                        else:
+                            other_jobs.append(job)
+
+                    outputs = []
+
+                    # Handle alphafold3: per-job single-dict JSON inputs
+                    if af3_jobs:
+                        to_run = []
+                        for job in af3_jobs:
+                            if self.check_prediction_exists(job["name"]):
+                                print(f"jobs name {job['name']} already exist, skipping...")
+                                continue
+                            job = self._ensure_model_seeds(job)
+                            # Save per-job JSON into unified stash dir
+                            safe_name = job["name"].lower().replace(' ', '_')
+                            job_json = os.path.join(af3_stash_dir, f"{safe_name}.input.json")
+                            with open(job_json, "w") as jf:
+                                json.dump(job, jf, indent=2)
+                            to_run.append(job_json)
+
+                        for job_json in to_run:
+                            cmd = _build_command(job_json, gpu_id)
+                            out = run_alphafold(cmd, placeholder)
+                            outputs.append(out)
+                            # After run, copy the input json into its result folder
+                            try:
+                                with open(job_json) as jf:
+                                    job_obj = json.load(jf)
+                                job_dir = os.path.join(self.OUTPUT_DIR, job_obj["name"].lower())
+                                os.makedirs(job_dir, exist_ok=True)
+                                shutil.copy2(job_json, os.path.join(job_dir, "input.json"))
+                            except Exception as e:
+                                print(f"Warning: failed to copy input json for {job_json}: {e}")
+
+                    # Handle other dialects in batch (list) mode as before
+                    if other_jobs:
+                        # Filter out completed
+                        jobs_to_process = [j for j in other_jobs if not self.check_prediction_exists(j["name"])]
+                        if jobs_to_process:
+                            # Overwrite file with the remaining non-AF3 jobs
+                            with open(input_path, 'w') as f:
+                                json.dump(jobs_to_process, f, indent=2)
+                            cmd = _build_command(input_path, gpu_id)
+                            outputs.append(run_alphafold(cmd, placeholder))
+                        else:
+                            print(f"All non-AF3 predictions in {input_path} already exist, skipping...")
+
+                    return "\n".join([o for o in outputs if o])
 
                 # Create job-GPU pairs
                 job_gpu_pairs = list(zip(input_data["input_paths"], gpu_ids))
@@ -293,47 +387,64 @@ class AlphaFoldModel:
         with open(input_path) as f:
             jobs_data = json.load(f)
 
+        # Normalize to list if batch_mode
         if not isinstance(jobs_data, list) and input_data.get("batch_mode", True):
-            jobs_data = [jobs_data]
-            
-        if input_data.get("batch_mode", True):
-            # Create a new list to store jobs that need to be processed
-            jobs_to_process = []
-            for job in jobs_data:
-                check = self.check_prediction_exists(job["name"])
-                if check is True:
+            jobs = [jobs_data]
+        elif isinstance(jobs_data, list):
+            jobs = jobs_data
+        else:
+            jobs = [jobs_data]
+
+        # Split by dialect
+        af3_jobs = [j for j in jobs if j.get("dialect") == "alphafold3"]
+        other_jobs = [j for j in jobs if j.get("dialect") != "alphafold3"]
+
+        gpu_id = device.split(":")[1] if ":" in device else device
+
+        outputs = []
+
+        # Alphafold3: per-job JSON dicts
+        if af3_jobs:
+            to_run = []
+            for job in af3_jobs:
+                if self.check_prediction_exists(job["name"]):
                     print(f"jobs name {job['name']} already exist, skipping...")
-                else:
-                    jobs_to_process.append(job)
-            
+                    continue
+                job = self._ensure_model_seeds(job)
+                # Save per-job JSON into unified stash dir
+                safe_name = job["name"].lower().replace(' ', '_')
+                job_json = os.path.join(af3_stash_dir, f"{safe_name}.input.json")
+                with open(job_json, "w") as jf:
+                    json.dump(job, jf, indent=2)
+                to_run.append(job_json)
+
+            for job_json in to_run:
+                cmd = _build_command(job_json, gpu_id)
+                out = run_alphafold(cmd, placeholder)
+                outputs.append(out)
+                # After run, copy the input json into its result folder
+                try:
+                    with open(job_json) as jf:
+                        job_obj = json.load(jf)
+                    job_dir = os.path.join(self.OUTPUT_DIR, job_obj["name"].lower())
+                    os.makedirs(job_dir, exist_ok=True)
+                    shutil.copy2(job_json, os.path.join(job_dir, "input.json"))
+                except Exception as e:
+                    print(f"Warning: failed to copy input json for {job_json}: {e}")
+
+        # Other dialects: retain existing list-based batching behavior
+        if other_jobs:
+            jobs_to_process = [j for j in other_jobs if not self.check_prediction_exists(j["name"])]
             if not jobs_to_process:
                 print("All jobs already exist, nothing to process")
-                return ""
-                
-            # Write the filtered jobs back to the input file
-            with open(input_path, 'w') as f:
-                json.dump(jobs_to_process, f, indent=2)
-        else:
-            check = self.check_prediction_exists(jobs_data["name"])
-            if check is True:
-                print(f"jobs name {jobs_data['name']} already exist, skipping...")
-                return ""
+            else:
+                # Overwrite the input file with remaining non-AF3 jobs and run once
+                with open(input_path, 'w') as f:
+                    json.dump(jobs_to_process, f, indent=2)
+                cmd = _build_command(input_path, gpu_id)
+                outputs.append(run_alphafold(cmd, placeholder))
 
-        command = (
-            f"cd {self.config['execution']['base_dir']} && "
-            f"CUDA_VISIBLE_DEVICES={device.split(':')[1]} conda run -n {self.required_env} "
-            f"python run_alphafold.py "
-            f"--json_path={input_path} "
-            f"--model_dir={self.model_weights_path} "
-            f"--output_dir={self.OUTPUT_DIR} "
-            f"--db_dir={self.database_path} "
-            f"--jackhmmer_binary_path={self.config['binaries']['jackhmmer']} "
-            f"--hmmbuild_binary_path={self.config['binaries']['hmmbuild']} "
-            f"--hmmsearch_binary_path={self.config['binaries']['hmmsearch']} "
-            f"--nhmmer_binary_path={self.config['binaries']['nhmmer']} "
-        )
-        
-        return run_alphafold(command, placeholder)
+        return "\n".join([o for o in outputs if o])
         
     def process_output(self, output_dir: str, config: Dict) -> Dict:
         # 查找最新的输出文件
@@ -360,6 +471,9 @@ if __name__ == "__main__":
         input_data = model.batch_prepare_sequences(sequences, "234321")
     else:
         input_data = model.single_prepare_sequences(sequences, "234321")
+    
+
+    
     gpu_ids = "0"
     gpu_num = len(gpu_ids.split(","))
     input_data = model.prepare_input(input_data, batch_mode=batch_mode, num_gpus=gpu_num, name_prefix="aha_batch")
